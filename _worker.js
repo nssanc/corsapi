@@ -150,6 +150,28 @@ async function getCachedJSON(url) {
   }
 }
 
+// v2.0.20: m3u8 KV 缓存 (借鉴 cmliu/edgetunnel 的 KV 缓存思路)
+// m3u8 内容大多静态, 同一个剧集每次播放都要重新 fetch + 解析 + 重写太浪费.
+// 5 分钟 TTL 兼顾"主播切线路时及时刷新"和"重复请求秒回".
+// cacheKey 含 origin, 避免 worker 换域名后返错链接.
+async function getCachedM3u8(cacheKey) {
+  if (typeof KV === 'undefined' || !KV || typeof KV.get !== 'function') return null
+  try {
+    return await KV.get(cacheKey)
+  } catch {
+    return null
+  }
+}
+
+async function setCachedM3u8(cacheKey, text) {
+  if (typeof KV === 'undefined' || !KV || typeof KV.put !== 'function') return
+  try {
+    await KV.put(cacheKey, text, { expirationTtl: 300 }) // 5 分钟
+  } catch (e) {
+    // 写缓存失败不影响主流程
+  }
+}
+
 // ---------- 安全版：错误日志 ----------
 async function logError(type, info) {
   // 保留错误输出，便于调试
@@ -181,6 +203,12 @@ async function handleRequest(request) {
     return new Response('OK', { status: 200, headers: CORS_HEADERS })
   }
 
+  // 🚀 测速端点：流式返回指定大小随机字节
+  // 默认 1MB, ?size=N (MB), 范围 1-50. 客户端测得下载速度 = 用户到 worker 的实际速度
+  if (pathname === '/speed') {
+    return handleSpeedTest(reqUrl)
+  }
+
   // 🔑 新增：处理源专属路径 /p/{sourceId}?url=...
   // 这样可以让 TVBox 认为每个源是不同的域名/路径
   if (pathname.startsWith('/p/') && targetUrlParam) {
@@ -189,6 +217,10 @@ async function handleRequest(request) {
 
   // 通用代理请求处理（兼容旧的 /?url=... 格式）
   if (targetUrlParam) {
+    // 单独的 m3u8 端点：拉 m3u8 并重写 .ts 链接
+    if (pathname === '/m3u8') {
+      return handleM3u8Request(request, targetUrlParam, currentOrigin)
+    }
     return handleProxyRequest(request, targetUrlParam, currentOrigin)
   }
 
@@ -242,25 +274,82 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
     return errorResponse('Invalid URL', { url: fullTargetUrl }, 400)
   }
 
+  // v2.0.20h: 优先用 worker 自带 Cache API, 绕开 Bunny.net 40 天老缓存
+  if (request.method === 'GET') {
+    try {
+      const cache = caches.default
+      const cacheKey = new Request(targetURL.toString(), { method: 'GET', headers: request.headers })
+      const cached = await cache.match(cacheKey)
+      if (cached) {
+        const h = new Headers(cached.headers)
+        h.set('Cache-Control', 'no-store')
+        h.set('X-Cache', 'WORKER-HIT')
+        return new Response(await cached.arrayBuffer(), { status: cached.status, headers: h })
+      }
+    } catch {}
+  }
+
+  // 构造透传请求头,如果客户端没带必要的头,按目标域名补上 fallback
+  // (典型:lain.bgm.tv 拒无 UA 的请求)
+  const upstreamHeaders = new Headers(request.headers)
+  applyDefaultHeadersForUpstream(upstreamHeaders, targetURL)
+
   try {
+    // v2.0.20f: 强制 upstream 重新校验, 绕开 Bunny.net 等 CDN 的 40 天老缓存
+    // (cdn-cachedat 显示 TMDB 走的 Bunny.net 缓存是 06/24 写的, 头里 alt-svc 一直老的)
+    upstreamHeaders.set('Cache-Control', 'max-age=0')
+    upstreamHeaders.set('Pragma', 'no-cache')
     const proxyRequest = new Request(targetURL.toString(), {
       method: request.method,
-      headers: request.headers,
+      headers: upstreamHeaders,
       body: request.method !== 'GET' && request.method !== 'HEAD'
         ? await request.arrayBuffer()
         : undefined,
     })
 
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 9000)
-    const response = await fetch(proxyRequest, { signal: controller.signal })
+    // v2.0.28: 视频 .ts 段可能几 MB, 9s 不够 → 30s
+    const timeoutId = setTimeout(() => controller.abort(), 30000)
+    // v2.0.28: 用 cf 选项让 CF cache .ts 段
+    // v2.0.20g: 删 .jpg/.jpeg/.png — 它们是图片, 不是视频段
+    //   之前错误归到 isTsSegment, 导致 image 走 public,max-age=3600 缓存 Bunny.net 40 天老数据
+    const isTsSegment = targetURL.pathname.endsWith('.ts') ||
+                        targetURL.pathname.endsWith('.m4s')
+    const fetchOptions = {
+      signal: controller.signal,
+      cf: isTsSegment ? {
+        cacheTtl: 3600,          // CF edge cache 1 小时
+        cacheEverything: true,   // 缓存所有响应 (包括非 200)
+      } : undefined,
+    }
+    const response = await fetch(proxyRequest, fetchOptions)
     clearTimeout(timeoutId)
+
+    // v2.0.20h: 存到 worker Cache, 下次同 URL 直接 hit
+    if (request.method === 'GET' && response.status === 200) {
+      try {
+        const cache = caches.default
+        const cacheKey = new Request(targetURL.toString(), { method: 'GET', headers: upstreamHeaders })
+        const respToCache = new Response(response.clone().body, { status: response.status, headers: response.headers })
+        await cache.put(cacheKey, respToCache)
+      } catch (e) {}
+    }
 
     const responseHeaders = new Headers(CORS_HEADERS)
     for (const [key, value] of response.headers) {
       if (!EXCLUDE_HEADERS.has(key.toLowerCase())) {
         responseHeaders.set(key, value)
       }
+    }
+    // v2.0.20f: 默认所有响应 no-store, 防止 CF 边缘缓存 Bunny.net 的 40 天老响应
+    if (response.status === 200) {
+      responseHeaders.set('Cache-Control', 'no-store, no-cache, must-revalidate')
+      responseHeaders.set('Pragma', 'no-cache')
+    }
+    // v2.0.28: .ts 段加 Cache-Control, 让 CF edge cache
+    if (isTsSegment && response.status === 200) {
+      responseHeaders.set('Cache-Control', 'public, max-age=3600')
+      responseHeaders.set('CDN-Cache-Control', 'public, max-age=3600')
     }
 
     return new Response(response.body, {
@@ -276,6 +365,226 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
       timestamp: new Date().toISOString()
     }, 502)
   }
+}
+
+// 按目标域名补默认请求头 (客户端漏带 UA/Referer 时,补上,避免上游 400/403)
+function applyDefaultHeadersForUpstream(headers, targetURL) {
+  const host = targetURL.hostname.toLowerCase()
+  // Bangumi 图片/数据系列:lain.bgm.tv / api.bgm.tv / bgm.tv
+  if (host === 'lain.bgm.tv' || host === 'api.bgm.tv' || host === 'bgm.tv' || host.endsWith('.bgm.tv')) {
+    // ⚠️ api.bgm.tv v0 API 强制要求 UA 是 "App/Version (URL)" 格式,
+    // Chrome 标准 UA 会返 400
+    if (!headers.has('User-Agent')) {
+      headers.set('User-Agent', 'LunaTV-Mobile/1.0 (https://github.com/djsevenx1/LunaTV-Mobile)')
+    }
+    if (!headers.has('Referer')) {
+      headers.set('Referer', 'https://bgm.tv/')
+    }
+    if (!headers.has('Accept')) {
+      headers.set('Accept', 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8')
+    }
+  }
+  // v2.0.28: 通用 fallback — 视频源/API 补 UA + Referer
+  // 很多多线视频 CDN 需要 Referer 才返回 m3u8/.ts, 否则 403
+  if (!headers.has('User-Agent')) {
+    headers.set('User-Agent', 'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36')
+  }
+  if (!headers.has('Referer')) {
+    headers.set('Referer', targetURL.origin + '/')
+  }
+  if (!headers.has('Accept')) {
+    headers.set('Accept', '*/*')
+  }
+}
+
+// ---------- M3U8 代理：拉 m3u8 并把 .ts 子链接也走 Worker ----------
+async function handleM3u8Request(request, targetUrlParam, currentOrigin) {
+  if (targetUrlParam.startsWith(currentOrigin)) {
+    return errorResponse('Loop detected: self-fetch blocked', { url: targetUrlParam }, 400)
+  }
+  if (!/^https?:\/\//i.test(targetUrlParam)) {
+    return errorResponse('Invalid target URL', { url: targetUrlParam }, 400)
+  }
+
+  let fullTargetUrl = targetUrlParam
+  const urlMatch = request.url.match(/[?&]url=([^&]+)/)
+  if (urlMatch) fullTargetUrl = decodeURIComponent(urlMatch[1])
+
+  // 携带额外 query
+  const reqUrl = new URL(request.url)
+  const extraParams = new URLSearchParams()
+  for (const [key, value] of reqUrl.searchParams) {
+    if (key !== 'url') extraParams.append(key, value)
+  }
+
+  let targetURL
+  try {
+    targetURL = new URL(fullTargetUrl)
+    for (const [key, value] of extraParams) {
+      targetURL.searchParams.append(key, value)
+    }
+  } catch {
+    return errorResponse('Invalid URL', { url: fullTargetUrl }, 400)
+  }
+
+  // v2.0.20: KV 缓存查询 (含 origin 避免跨域名错链, ?nocache=1 跳过)
+  const cacheKey = `M3U8_${currentOrigin}_${targetURL.toString()}`
+  const nocache = reqUrl.searchParams.get('nocache') === '1'
+  if (!nocache) {
+    const cached = await getCachedM3u8(cacheKey)
+    if (cached !== null) {
+      return new Response(cached, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/vnd.apple.mpegurl',
+          'Cache-Control': 'public, max-age=60',
+          'X-Cache': 'HIT',
+          'X-Cache-TTL': '300',
+          // 借鉴: HTTP/3 Alt-Svc, 让客户端升级到 QUIC (CF 默认开, 几乎零成本)
+          'Alt-Svc': 'h3=":443"; ma=86400',
+          ...CORS_HEADERS,
+        },
+      })
+    }
+  }
+
+  const baseOrigin = currentOrigin
+  // v2.0.30: m3u8 端点也要识别 sub-m3u8 (递归), 用 /m3u8?url= 而不是 /?url=
+  // 否则 /?url= 拿到 sub-m3u8 后只 text() 原样返回, 里面的 .ts 链接没被重写
+  // libmpv 按 HLS 规范用 m3u8 自身 URL 解析相对 .ts → 错 → duration 出不来
+  const wrapBase = (rawUrl) => {
+    const u = (rawUrl || '').toLowerCase()
+    if (u.endsWith('.m3u8') || u.endsWith('.m3u')) return `${baseOrigin}/m3u8?url=`
+    return `${baseOrigin}/?url=`
+  }
+
+  // 判断一个 segment 链接是否需要包代理
+  // 1) 绝对 http(s) 链接：包一层 ?url= 走本 worker
+  // 2) 相对路径 / 协议相对 //开头：用 m3u8 自身 base 拼成绝对再包
+  // 3) v2.0.30: m3u8 后缀用 /m3u8?url= (递归重写), 其他用 /?url= (直接转发)
+  const wrapSegment = (rawLine) => {
+    const line = rawLine.trim()
+    if (!line) return line
+    // 注释行 / EXT 行不动
+    if (line.startsWith('#')) return line
+    // 已经是 http 绝对
+    if (/^https?:\/\//i.test(line)) {
+      return wrapBase(line) + encodeURIComponent(line)
+    }
+    // 协议相对 //host/path
+    if (line.startsWith('//')) {
+      const abs = targetURL.protocol + line
+      return wrapBase(abs) + encodeURIComponent(abs)
+    }
+    // 相对路径
+    try {
+      const abs = new URL(line, targetURL).toString()
+      return wrapBase(abs) + encodeURIComponent(abs)
+    } catch {
+      return line
+    }
+  }
+
+  try {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 15000)
+    // v2.0.28: 带 Referer + Origin, 很多视频源需要才能返回 m3u8
+    const upstream = await fetch(targetURL.toString(), {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+        'Referer': targetURL.origin + '/',
+        'Origin': targetURL.origin,
+        'Accept': '*/*',
+      },
+      signal: controller.signal,
+    })
+    clearTimeout(timeoutId)
+    const text = await upstream.text()
+
+    // v2.0.63: 检测上游返回的是不是有效 m3u8 (以 #EXTM3U 开头).
+    //   有些源给的是 /share/xxx 分享页 (HTML), worker 之前把 HTML 当 m3u8
+    //   解析, 每行包一层 ?url= 返回伪 m3u8 → libmpv "Failed to recognize
+    //   file format". 现在不是 m3u8 就原样转发 (带原 Content-Type), 让
+    //   客户端自己处理.
+    const trimmed = text.trimStart()
+    if (!trimmed.startsWith('#EXTM3U')) {
+      const headers = new Headers(upstream.headers)
+      headers.set('Access-Control-Allow-Origin', '*')
+      headers.delete('content-encoding')
+      headers.delete('content-length')
+      return new Response(text, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers,
+      })
+    }
+
+    // 简单判断 master playlist (含 #EXT-X-STREAM-INF) → 递归把所有 variant m3u8 也包一层
+    const isMaster = /#EXT-X-STREAM-INF/i.test(text)
+
+    const lines = text.split(/\r?\n/)
+    const out = []
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      // 对 URI="..." 属性里的链接也包一层
+      if (/^#EXT-X-KEY/i.test(line) || /^#EXT-X-MAP/i.test(line) || /^#EXT-X-MEDIA/i.test(line) || /^#EXT-X-I-FRAME-STREAM-INF/i.test(line)) {
+        out.push(line.replace(/URI="([^"]+)"/g, (m, u) => {
+          let abs
+          try { abs = new URL(u, targetURL).toString() } catch { abs = u }
+          return `URI="${wrapBase(abs) + encodeURIComponent(abs)}"`
+        }))
+        continue
+      }
+      // variant stream 行
+      if (isMaster && /^#EXT-X-STREAM-INF/i.test(line)) {
+        out.push(line)
+        // 紧跟的下一行就是 variant 链接
+        if (i + 1 < lines.length) {
+          out.push(wrapSegment(lines[i + 1]))
+          i++
+        }
+        continue
+      }
+      out.push(wrapSegment(line))
+    }
+
+    const outText = out.join('\n')
+
+    // v2.0.20: 写缓存 (后台 fire-and-forget, 不阻塞响应)
+    if (!nocache) {
+      ctxWaitUntil(setCachedM3u8(cacheKey, outText))
+    }
+
+    return new Response(outText, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Cache-Control': 'no-store',
+        'X-Cache': nocache ? 'BYPASS' : 'MISS',
+        'Alt-Svc': 'h3=":443"; ma=86400',
+        ...CORS_HEADERS,
+      },
+    })
+  } catch (err) {
+    await logError('m3u8', { message: err.message, url: fullTargetUrl })
+    return errorResponse('M3U8 Proxy Error', {
+      message: err.message,
+      target: fullTargetUrl,
+    }, 502)
+  }
+}
+
+// v2.0.20: ctx.waitUntil 的安全 fallback
+// Pages Functions 没 ctx, Netlify 也没, 直接执行函数即可
+function ctxWaitUntil(promise) {
+  try {
+    if (typeof ctx !== 'undefined' && ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(promise)
+      return
+    }
+  } catch {}
+  // 没 ctx 就当普通 promise, 不 await (fire-and-forget)
+  promise.catch(() => {})
 }
 
 // ---------- JSON 格式输出处理子模块 ----------
@@ -309,7 +618,7 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
   }
 }
 
-// ---------- 首页文档处理 ----------
+// ---------- 首页文档处理 (LunaTV 风格: 深色 + 绿主色 #22C55E) ----------
 async function handleHomePage(currentOrigin, defaultPrefix) {
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -319,146 +628,312 @@ async function handleHomePage(currentOrigin, defaultPrefix) {
   <title>CORSAPI - API 中转代理服务</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --luna-green: #22C55E;
+      --luna-green-deep: #10B981;
+      --bg: #0F1117;
+      --card: #1F2937;
+      --border: #374151;
+      --text: #FFFFFF;
+      --sub: #9ca3af;
+      --muted: #6b7280;
+    }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-      max-width: 900px;
-      margin: 0 auto;
-      padding: 40px 20px;
-      line-height: 1.8;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
       min-height: 100vh;
+      line-height: 1.6;
+      padding: 24px 16px;
     }
     .container {
-      background: white;
-      border-radius: 12px;
-      padding: 40px;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+      max-width: 880px;
+      margin: 0 auto;
     }
-    h1 { color: #667eea; margin-bottom: 10px; font-size: 2.5em; }
-    .subtitle { color: #666; margin-bottom: 30px; font-size: 1.1em; }
-    h2 {
-      color: #333;
-      margin-top: 35px;
-      margin-bottom: 15px;
-      padding-bottom: 8px;
-      border-bottom: 2px solid #667eea;
+    /* 顶部条 (跟 LunaTV Web 顶栏同款) */
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 4px 24px 4px;
     }
-    code {
-      background: #f4f4f4;
-      padding: 3px 8px;
-      border-radius: 4px;
-      font-size: 0.9em;
-      color: #d63384;
-      font-family: 'Consolas', 'Monaco', monospace;
+    .logo {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      background: linear-gradient(135deg, var(--luna-green), var(--luna-green-deep));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      color: #052e16;
+      font-size: 14px;
     }
-    pre {
-      background: #2d2d2d;
-      color: #f8f8f2;
-      padding: 20px;
-      border-radius: 8px;
-      overflow-x: auto;
-      margin: 15px 0;
-      font-family: 'Consolas', 'Monaco', monospace;
+    .brand {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text);
     }
-    .example {
-      background: #e8f5e9;
-      padding: 20px;
-      border-left: 4px solid #4caf50;
-      margin: 20px 0;
-      border-radius: 4px;
-    }
-    ul { margin: 15px 0; padding-left: 25px; }
-    li { margin: 10px 0; }
-    .badge {
-      display: inline-block;
+    .pill {
+      margin-left: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
       padding: 4px 10px;
-      background: #667eea;
-      color: white;
-      border-radius: 12px;
-      font-size: 0.85em;
-      margin-left: 8px;
+      background: rgba(34, 197, 94, 0.12);
+      color: var(--luna-green);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
     }
-    .footer {
-      margin-top: 40px;
-      padding-top: 20px;
-      border-top: 1px solid #eee;
-      color: #666;
-      font-size: 0.9em;
-      text-align: center;
-    }
-    .footer a { color: #667eea; text-decoration: none; }
-    .footer a:hover { text-decoration: underline; }
-    .status {
-      display: inline-block;
-      width: 8px;
-      height: 8px;
-      background: #4caf50;
+    .pill .dot {
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
-      margin-right: 6px;
+      background: var(--luna-green);
       animation: pulse 2s infinite;
     }
     @keyframes pulse {
       0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
+      50% { opacity: 0.4; }
+    }
+    /* 头部 */
+    .hero {
+      padding: 32px 28px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 20px;
+    }
+    .hero h1 {
+      font-size: 28px;
+      font-weight: 800;
+      margin-bottom: 8px;
+      color: var(--text);
+    }
+    .hero h1 .accent {
+      color: var(--luna-green);
+    }
+    .hero p {
+      color: var(--sub);
+      font-size: 14px;
+      margin-bottom: 16px;
+    }
+    .url-card {
+      background: #0b0e14;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+      font-family: 'SF Mono', Consolas, Monaco, monospace;
+      font-size: 13px;
+      color: var(--luna-green);
+      word-break: break-all;
+      margin-bottom: 8px;
+    }
+    .url-card .label {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 6px;
+      font-family: -apple-system, sans-serif;
+    }
+    /* 章节 */
+    .section {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 16px;
+    }
+    .section-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 14px;
+    }
+    .section-title::before {
+      content: "";
+      width: 3px;
+      height: 14px;
+      background: linear-gradient(180deg, var(--luna-green), var(--luna-green-deep));
+      border-radius: 2px;
+    }
+    .section p {
+      color: var(--sub);
+      font-size: 14px;
+      margin-bottom: 10px;
+    }
+    .section p:last-child {
+      margin-bottom: 0;
+    }
+    pre {
+      background: #0b0e14;
+      color: #d1d5db;
+      padding: 14px 16px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      overflow-x: auto;
+      font-family: 'SF Mono', Consolas, Monaco, monospace;
+      font-size: 12.5px;
+      line-height: 1.6;
+      margin: 10px 0;
+      white-space: pre;
+    }
+    pre .g { color: var(--luna-green); }
+    pre .d { color: var(--muted); }
+    code {
+      background: rgba(34, 197, 94, 0.12);
+      color: var(--luna-green);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'SF Mono', Consolas, Monaco, monospace;
+      font-size: 12.5px;
+    }
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 8px 0;
+    }
+    li {
+      color: var(--sub);
+      font-size: 14px;
+      padding: 6px 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    li::before {
+      content: "";
+      width: 5px;
+      height: 5px;
+      background: var(--luna-green);
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    /* 网格 */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .feat {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-size: 13.5px;
+      color: var(--sub);
+    }
+    .feat b {
+      color: var(--luna-green);
+      font-weight: 600;
+    }
+    /* 底部 */
+    .footer {
+      text-align: center;
+      padding: 20px 0 4px 0;
+      color: var(--muted);
+      font-size: 12.5px;
+    }
+    .footer a {
+      color: var(--luna-green);
+      text-decoration: none;
+    }
+    .footer a:hover {
+      text-decoration: underline;
+    }
+    @media (max-width: 600px) {
+      body { padding: 16px 12px; }
+      .hero { padding: 22px 18px; }
+      .hero h1 { font-size: 22px; }
+      .section { padding: 16px 18px; }
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>🔄 CORSAPI</h1>
-    <p class="subtitle"><span class="status"></span>API 中转代理服务正在运行</p>
-
-    <p>基于 Cloudflare Workers 的通用 API 中转代理服务，用于加速和转发 API 请求。</p>
-
-    <h2>📖 基本用法</h2>
-    <p>在 API 请求前添加代理地址和 <code>?url=</code> 参数：</p>
-    <pre>${defaultPrefix}https://api.example.com/endpoint</pre>
-
-    <div class="example">
-      <strong>示例：代理一个 API 请求</strong><br><br>
-      原始请求：<code>https://api.example.com/data?id=123</code><br>
-      通过代理：<code>${currentOrigin}/?url=https://api.example.com/data&id=123</code>
+    <!-- 顶部条 -->
+    <div class="topbar">
+      <div class="logo">L</div>
+      <span class="brand">CORSAPI</span>
+      <span class="pill"><span class="dot"></span>运行中</span>
     </div>
 
-    <h2>🚀 高级用法</h2>
-    <p>使用专属路径避免缓存冲突（推荐）：</p>
-    <pre>${currentOrigin}/p/source1?url=https://api1.example.com/endpoint</pre>
-    <p>为不同 API 源使用不同路径标识符（如 <code>/p/source1</code>、<code>/p/source2</code>），可以：</p>
-    <ul>
-      <li>避免不同源之间的缓存冲突</li>
-      <li>提高客户端兼容性</li>
-      <li>更好的请求管理</li>
-    </ul>
-
-    <h2>🔧 参数转发</h2>
-    <p>所有额外的 query 参数都会自动转发到目标 API：</p>
-    <div class="example">
-      <strong>参数自动转发示例</strong><br><br>
-      请求：<code>${currentOrigin}/?url=https://api.example.com/list&page=1&limit=10</code><br>
-      转发：<code>https://api.example.com/list?page=1&limit=10</code>
+    <!-- 头部 -->
+    <div class="hero">
+      <h1>API 中转代理服务 <span class="accent">/ LunaTV 配套</span></h1>
+      <p>通用 API 中转代理,用于加速和转发跨域 API 请求。部署在 ${detectPlatform()} 上。</p>
+      <div class="url-card">
+        <div class="label">基本用法 · 在 API 请求前添加代理 + <code>?url=</code></div>
+        ${defaultPrefix}https://api.example.com/endpoint
+      </div>
+      <div class="url-card">
+        <div class="label">M3U8 代理 · 拉 m3u8 并把 .ts 段链接也走 worker</div>
+        ${currentOrigin}/m3u8?url=https://example.com/index.m3u8
+      </div>
     </div>
 
-    <h2>✨ 功能特性</h2>
-    <ul>
-      <li>✅ 支持所有 HTTP 方法（GET、POST、PUT、DELETE 等）</li>
-      <li>✅ 自动转发请求头和请求体</li>
-      <li>✅ 完整的 CORS 支持</li>
-      <li>✅ 超时保护<span class="badge">9秒</span></li>
-      <li>✅ 自动参数转发</li>
-      <li>✅ 防止递归调用</li>
-      <li>✅ 可选的 KV 缓存支持</li>
-    </ul>
+    <!-- 端点 -->
+    <div class="section">
+      <div class="section-title">端点</div>
+      <ul>
+        <li><code>GET /?url=&lt;encoded&gt;</code> 通用代理,透传 method/headers/body</li>
+        <li><code>GET /m3u8?url=&lt;encoded&gt;</code> m3u8 代理,自动重写 .ts 链接为 <code>worker/?url=...</code></li>
+        <li><code>GET /p/{source}?url=&lt;encoded&gt;</code> 源专属路径,避免缓存冲突</li>
+        <li><code>GET /health</code> 健康检查</li>
+        <li><code>GET /?format=1&amp;source=full</code> 输出 LunaTV JSON 配置 (proxy 模式)</li>
+      </ul>
+    </div>
 
-    <h2>🏥 健康检查</h2>
-    <p>访问 <code>/health</code> 端点检查服务状态：</p>
-    <pre>${currentOrigin}/health</pre>
+    <!-- 用法示例 -->
+    <div class="section">
+      <div class="section-title">用法示例</div>
+      <p>代理一个 API 请求:</p>
+      <pre>原始: <span class="d">https://api.example.com/data?id=123</span>
+代理: <span class="g">${currentOrigin}/?url=https://api.example.com/data?id=123</span></pre>
+      <p>额外 query 参数自动转发到目标 URL:</p>
+      <pre>请求: <span class="g">${currentOrigin}/?url=https://api.example.com/list&page=1&limit=10</span>
+转发: <span class="d">https://api.example.com/list?page=1&limit=10</span></pre>
+    </div>
+
+    <!-- 特性 -->
+    <div class="section">
+      <div class="section-title">功能特性</div>
+      <div class="grid">
+        <div class="feat"><b>HTTP 全方法</b><br>GET / POST / PUT / DELETE 等</div>
+        <div class="feat"><b>自动参数转发</b><br>query 透传给目标</div>
+        <div class="feat"><b>CORS 完整</b><br>Access-Control-* 全套</div>
+        <div class="feat"><b>超时保护</b><br>9 秒,避免悬挂</div>
+        <div class="feat"><b>自反循环检测</b><br>防止 worker 套 worker</div>
+        <div class="feat"><b>bgm.tv fallback</b><br>UA / Referer 自动补</div>
+        <div class="feat"><b>M3U8 KV 缓存</b><br>5 分钟复用, 减少 worker CPU</div>
+        <div class="feat"><b>HTTP/3 (QUIC)</b><br>Alt-Svc 头提示升级, CF 默认开</div>
+      </div>
+    </div>
+
+    <!-- 配套 -->
+    <div class="section">
+      <div class="section-title">配套 App</div>
+      <p>推荐配合 <code>LunaTV-Mobile</code> 使用,在 App 菜单填入 worker 域名即可自动接管 Bangumi 数据/图片代理 + 源加速 + m3u8 端点重写。</p>
+      <pre>Bangumi 数据源  → <span class="g">CF Worker 加速</span>
+Bangumi 图片源  → <span class="g">CF Worker 加速</span>
+播放器源测速   → 走 worker (测得延迟 ≈ 实际播放延迟)
+m3u8 播放      → 走 <span class="g">/m3u8?url=</span>, .ts 子链接自动重写到 worker</pre>
+    </div>
 
     <div class="footer">
-      <p>
-        项目地址：<a href="https://github.com/SzeMeng76/CORSAPI" target="_blank">SzeMeng76/CORSAPI</a><br>
-        <small>基于 <a href="https://github.com/hafrey1/LunaTV-config" target="_blank">hafrey1/LunaTV-config</a> 二次开发</small>
-      </p>
-      <p>Powered by Cloudflare Workers</p>
+      <a href="https://github.com/SzeMeng76/CORSAPI" target="_blank">SzeMeng76/CORSAPI</a>
+      &nbsp;·&nbsp;
+      <a href="https://github.com/djsevenx1/CORSAPI" target="_blank">djsevenx1/CORSAPI</a>
+      &nbsp;·&nbsp;
+      <a href="https://github.com/djsevenx1/LunaTV-Mobile" target="_blank">LunaTV-Mobile</a>
+      <br>
+      <span style="margin-top: 6px; display: inline-block;">Powered by ${detectPlatform()}</span>
     </div>
   </div>
 </body>
@@ -470,6 +945,39 @@ async function handleHomePage(currentOrigin, defaultPrefix) {
   })
 }
 
+// ---------- 测速端点 ----------
+// 流式返回指定 MB 数的随机字节, 客户端测下载速度 = 用户到 worker 的实际带宽
+// 默认 1MB, ?size=N (MB), 范围 1-3 (v2.0.84 缩小到 3MB 上限).
+// v2.0.84 用 Uint8Array 一次性 Response, 不用 ReadableStream/TransformStream,
+//   避免 CF edge backpressure 切断问题.
+//   v2.0.80 setTimeout 0 → CF edge 误判流空闲切断 (mobile 收到 0 字节)
+//   v2.0.81 一次性 50MB Uint8Array → 1MB 也 500 (CF Workers 内存峰值问题)
+//   v2.0.82 start 一次性 enqueue → CF edge 反复切断, 1MB 测试 15s 只传 415KB
+//   v2.0.83 pull + TransformStream → 太复杂, 仍然会被 backpressure 切
+//   v2.0.84 Uint8Array(size).fill(0) 不调 crypto.getRandomValues, Response 直接 return.
+//     1MB / 2MB / 3MB Uint8Array 内存峰值 < 4MB, 远低于 128MB 限制
+//     不用 random 是因为 crypto.getRandomValues 在某些 CF edge 节点会触发额外内存分配
+//     测速场景不需要密码学安全随机, 0 字节能填满带宽就够
+async function handleSpeedTest(reqUrl) {
+  const sizeParam = parseInt(reqUrl.searchParams.get('size') || '1', 10)
+  // v2.0.84: 上限 3MB, 内存峰值 < 4MB 完全安全
+  const sizeMB = Math.max(1, Math.min(3, isNaN(sizeParam) ? 1 : sizeParam))
+  const totalBytes = sizeMB * 1024 * 1024
+  // 一次性 Uint8Array 全填 0, 不调 crypto.getRandomValues (避免某些节点内存爆)
+  const buffer = new Uint8Array(totalBytes)
+
+  return new Response(buffer, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': totalBytes.toString(),
+      'Content-Disposition': `attachment; filename="speedtest-${sizeMB}mb.bin"`,
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+      ...CORS_HEADERS
+    }
+  })
+}
+
 // ---------- 统一错误响应处理 ----------
 function errorResponse(error, data = {}, status = 400) {
   return new Response(JSON.stringify({ error, ...data }), {
@@ -477,3 +985,17 @@ function errorResponse(error, data = {}, status = 400) {
     headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS_HEADERS }
   })
 }
+
+
+// ---------- 平台检测 (首页 "Powered by ..." 用) ----------
+// Cloudflare Workers 没 Deno 全局, Netlify Edge Functions (Deno) 有
+function detectPlatform() {
+  if (typeof Deno !== 'undefined') return 'Netlify Edge Functions (Deno)'
+  return 'Cloudflare Workers'
+}
+
+// ---------- 命名导出 ----------
+// 供 netlify/edge-functions/corsapi.js 复用同一个 handleRequest
+// 不重复维护两套逻辑. Cloudflare 走上面 export default { fetch } 入口,
+// Netlify 走 netlify/edge-functions/corsapi.js 导入这个 handleRequest
+export { handleRequest, detectPlatform }
