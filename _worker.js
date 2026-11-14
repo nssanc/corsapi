@@ -908,6 +908,14 @@ async function handleHomePage(currentOrigin, defaultPrefix) {
     .footer a:hover {
       text-decoration: underline;
     }
+    .url-card a {
+      color: inherit;
+      text-decoration: none;
+      word-break: break-all;
+    }
+    .url-card a:hover {
+      text-decoration: underline;
+    }
     @media (max-width: 600px) {
       body { padding: 16px 12px; }
       .hero { padding: 22px 18px; }
@@ -928,15 +936,26 @@ async function handleHomePage(currentOrigin, defaultPrefix) {
     <!-- 头部 -->
     <div class="hero">
       <h1>API 中转代理服务 <span class="accent">/ LunaTV 配套</span></h1>
-      <p>通用 API 中转代理,用于加速和转发跨域 API 请求。部署在 ${detectPlatform()} 上。</p>
+      <p>提供 LunaTV 合并订阅、CMS 接口代理、跨域转发和 M3U8 链接重写。部署在 ${detectPlatform()} 上。</p>
       <div class="url-card">
-        <div class="label">基本用法 · 在 API 请求前添加代理 + <code>?url=</code></div>
-        ${defaultPrefix}https://api.example.com/endpoint
+        <div class="label">推荐订阅 · 原 jin18 与已验证 Type-1 接口动态合并、自动去重</div>
+        <a href="${currentOrigin}/?format=3&amp;source=jin18">${currentOrigin}/?format=3&amp;source=jin18</a>
       </div>
       <div class="url-card">
-        <div class="label">M3U8 代理 · 拉 m3u8 并把 .ts 段链接也走 worker</div>
-        ${currentOrigin}/m3u8?url=https://example.com/index.m3u8
+        <div class="label">调试配置 · 输出便于查看的代理 JSON</div>
+        <a href="${currentOrigin}/?format=1&amp;source=jin18">${currentOrigin}/?format=1&amp;source=jin18</a>
       </div>
+    </div>
+
+    <!-- 合并订阅 -->
+    <div class="section">
+      <div class="section-title">合并订阅</div>
+      <p><code>source=jin18</code> 会在每次缓存更新时读取原 jin18 配置与本项目已验证的 Type-1 配置，按 API 地址合并去重。当前部署验证为 40 个源，实际数量可能随上游更新而变化。</p>
+      <ul>
+        <li><code>format=3&amp;source=jin18</code> HTTPS 代理 + Base58，推荐用于 LunaTV</li>
+        <li><code>format=1&amp;source=jin18</code> HTTPS 代理 + JSON，适合检查和调试</li>
+        <li>原有源不会被删除；重复接口只保留一份</li>
+      </ul>
     </div>
 
     <!-- 端点 -->
@@ -947,8 +966,19 @@ async function handleHomePage(currentOrigin, defaultPrefix) {
         <li><code>GET /m3u8?url=&lt;encoded&gt;</code> m3u8 代理,自动重写 .ts 链接为 <code>worker/?url=...</code></li>
         <li><code>GET /p/{source}?url=&lt;encoded&gt;</code> 源专属路径,避免缓存冲突</li>
         <li><code>GET /health</code> 健康检查</li>
-        <li><code>GET /?format=1&amp;source=full</code> 输出 LunaTV JSON 配置 (proxy 模式)</li>
       </ul>
+    </div>
+
+    <!-- 订阅参数 -->
+    <div class="section">
+      <div class="section-title">订阅参数</div>
+      <div class="grid">
+        <div class="feat"><b>format=0 / raw</b><br>直连接口 + JSON</div>
+        <div class="feat"><b>format=1 / proxy</b><br>代理接口 + JSON</div>
+        <div class="feat"><b>format=2 / base58</b><br>直连接口 + Base58</div>
+        <div class="feat"><b>format=3 / proxy-base58</b><br>代理接口 + Base58（推荐）</div>
+      </div>
+      <p style="margin-top: 12px;"><code>source</code> 可选值：<code>jin18</code>（合并订阅）、<code>authorized</code> / <code>type1</code>（新增已验证接口）、<code>jingjian</code>、<code>full</code>。</p>
     </div>
 
     <!-- 用法示例 -->
@@ -977,22 +1007,17 @@ async function handleHomePage(currentOrigin, defaultPrefix) {
       </div>
     </div>
 
-    <!-- 配套 -->
+    <!-- 代理说明 -->
     <div class="section">
-      <div class="section-title">配套 App</div>
-      <p>推荐配合 <code>LunaTV-Mobile</code> 使用,在 App 菜单填入 worker 域名即可自动接管 Bangumi 数据/图片代理 + 源加速 + m3u8 端点重写。</p>
-      <pre>Bangumi 数据源  → <span class="g">CF Worker 加速</span>
-Bangumi 图片源  → <span class="g">CF Worker 加速</span>
-播放器源测速   → 走 worker (测得延迟 ≈ 实际播放延迟)
-m3u8 播放      → 走 <span class="g">/m3u8?url=</span>, .ts 子链接自动重写到 worker</pre>
+      <div class="section-title">代理说明</div>
+      <p>订阅中的每个 CMS 接口会生成独立的 <code>/p/{source}</code> 路径，减少缓存冲突并解决浏览器跨域或 HTTP 混合内容问题。</p>
+      <pre>CMS 接口      → <span class="g">/p/{source}?url=...</span>
+普通 API      → <span class="g">/?url=...</span>
+m3u8 播放     → <span class="g">/m3u8?url=...</span>（同时重写分片链接）</pre>
     </div>
 
     <div class="footer">
-      <a href="https://github.com/SzeMeng76/CORSAPI" target="_blank">SzeMeng76/CORSAPI</a>
-      &nbsp;·&nbsp;
-      <a href="https://github.com/djsevenx1/CORSAPI" target="_blank">djsevenx1/CORSAPI</a>
-      &nbsp;·&nbsp;
-      <a href="https://github.com/djsevenx1/LunaTV-Mobile" target="_blank">LunaTV-Mobile</a>
+      <a href="https://github.com/nssanc/corsapi" target="_blank">nssanc/corsapi</a>
       <br>
       <span style="margin-top: 6px; display: inline-block;">Powered by ${detectPlatform()}</span>
     </div>
