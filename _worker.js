@@ -26,7 +26,10 @@ const EXCLUDE_HEADERS = new Set([
 const JSON_SOURCES = {
   'authorized': 'https://raw.githubusercontent.com/nssanc/corsapi/refs/heads/main/authorized-type1.json',
   'type1': 'https://raw.githubusercontent.com/nssanc/corsapi/refs/heads/main/authorized-type1.json',
-  'jin18': 'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/jin18.json',
+  'jin18': [
+    'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/jin18.json',
+    'https://raw.githubusercontent.com/nssanc/corsapi/refs/heads/main/authorized-type1.json'
+  ],
   'jingjian': 'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/jingjian.json',
   'full': 'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/LunaTV-config.json'
 }
@@ -589,6 +592,60 @@ function ctxWaitUntil(promise) {
   promise.catch(() => {})
 }
 
+function normalizeApiForDedupe(api) {
+  if (typeof api !== 'string') return ''
+
+  let value = api.trim()
+  const proxiedIndex = value.indexOf('?url=')
+  if (proxiedIndex !== -1) {
+    value = value.slice(proxiedIndex + 5)
+    try { value = decodeURIComponent(value) } catch {}
+  }
+
+  try {
+    const url = new URL(value)
+    url.hash = ''
+    url.hostname = url.hostname.toLowerCase()
+    url.pathname = url.pathname.replace(/\/+$/, '')
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    return value.replace(/\/+$/, '').toLowerCase()
+  }
+}
+
+function mergeJSONConfigs(configs) {
+  const result = { cache_time: 7200, api_site: {} }
+  const seenApis = new Set()
+  const cacheTimes = []
+
+  for (const data of configs) {
+    if (!data || typeof data !== 'object') continue
+    if (Number.isFinite(Number(data.cache_time)) && Number(data.cache_time) > 0) {
+      cacheTimes.push(Number(data.cache_time))
+    }
+
+    const sites = data.api_site
+    if (!sites || typeof sites !== 'object') continue
+
+    for (const [originalKey, site] of Object.entries(sites)) {
+      if (!site || typeof site !== 'object' || typeof site.api !== 'string') continue
+      const normalizedApi = normalizeApiForDedupe(site.api)
+      if (!normalizedApi || seenApis.has(normalizedApi)) continue
+      seenApis.add(normalizedApi)
+
+      let key = originalKey
+      let suffix = 2
+      while (Object.prototype.hasOwnProperty.call(result.api_site, key)) {
+        key = `${originalKey}-${suffix++}`
+      }
+      result.api_site[key] = site
+    }
+  }
+
+  if (cacheTimes.length) result.cache_time = Math.min(...cacheTimes)
+  return result
+}
+
 // ---------- JSON 格式输出处理子模块 ----------
 async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix) {
   try {
@@ -598,7 +655,9 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
     }
 
     const selectedSource = JSON_SOURCES[sourceParam] || JSON_SOURCES['full']
-    const data = await getCachedJSON(selectedSource)
+    const data = Array.isArray(selectedSource)
+      ? mergeJSONConfigs(await Promise.all(selectedSource.map(getCachedJSON)))
+      : await getCachedJSON(selectedSource)
 
     const newData = config.proxy
       ? addOrReplacePrefix(data, prefixParam || defaultPrefix)
