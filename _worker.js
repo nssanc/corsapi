@@ -24,6 +24,8 @@ const EXCLUDE_HEADERS = new Set([
 ])
 
 const JSON_SOURCES = {
+  'authorized': 'https://raw.githubusercontent.com/nssanc/corsapi/refs/heads/main/authorized-type1.json',
+  'type1': 'https://raw.githubusercontent.com/nssanc/corsapi/refs/heads/main/authorized-type1.json',
   'jin18': 'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/jin18.json',
   'jingjian': 'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/jingjian.json',
   'full': 'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/LunaTV-config.json'

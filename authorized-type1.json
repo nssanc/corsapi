@@ -1,0 +1,100 @@
+{
+  "cache_time": 7200,
+  "api_site": {
+    "dyttzyapi.com": {
+      "name": "🎬电影天堂",
+      "api": "http://caiji.dyttzyapi.com/api.php/provide/vod",
+      "detail": "http://caiji.dyttzyapi.com"
+    },
+    "xinlangapi.com": {
+      "name": "🎬新浪资源",
+      "api": "http://api.xinlangapi.com/xinlangapi.php/provide/vod",
+      "detail": "http://api.xinlangapi.com"
+    },
+    "tyyszy.com": {
+      "name": "🎬天涯资源",
+      "api": "http://tyyszy.com/api.php/provide/vod",
+      "detail": "http://tyyszy.com"
+    },
+    "ffzy.tv": {
+      "name": "🎬非凡资源（一）",
+      "api": "http://ffzy.tv/api.php/provide/vod",
+      "detail": "http://ffzy.tv"
+    },
+    "ffzy1.tv": {
+      "name": "🎬非凡资源（二）",
+      "api": "http://ffzy1.tv/api.php/provide/vod",
+      "detail": "http://ffzy1.tv"
+    },
+    "api.guangsuapi.com": {
+      "name": "🎬光速资源",
+      "api": "https://api.guangsuapi.com/api.php/provide/vod",
+      "detail": "https://api.guangsuapi.com"
+    },
+    "sdzyapi.com": {
+      "name": "🎬闪电资源",
+      "api": "http://sdzyapi.com/api.php/provide/vod",
+      "detail": "http://sdzyapi.com"
+    },
+    "jszyapi.com": {
+      "name": "🎬极速资源",
+      "api": "https://jszyapi.com/api.php/provide/vod",
+      "detail": "https://jszyapi.com"
+    },
+    "suoniapi.com": {
+      "name": "🎬索尼资源",
+      "api": "https://suoniapi.com/api.php/provide/vod",
+      "detail": "https://suoniapi.com"
+    },
+    "api.apibdzy.com": {
+      "name": "🎬百度资源",
+      "api": "https://api.apibdzy.com/api.php/provide/vod",
+      "detail": "https://api.apibdzy.com"
+    },
+    "jacloudapi": {
+      "name": "🎬建安资源",
+      "api": "http://154.219.117.232:9981/jacloudapi.php/provide/vod",
+      "detail": "http://154.219.117.232:9981"
+    },
+    "www.hongniuzy2.com": {
+      "name": "🎬红牛资源",
+      "api": "https://www.hongniuzy2.com/api.php/provide/vod",
+      "detail": "https://www.hongniuzy2.com"
+    },
+    "cj.lziapi.com": {
+      "name": "🎬量子资源（一）",
+      "api": "https://cj.lziapi.com/api.php/provide/vod",
+      "detail": "https://cj.lziapi.com"
+    },
+    "lzizy1.com": {
+      "name": "🎬量子资源（二）",
+      "api": "https://lzizy1.com/api.php/provide/vod",
+      "detail": "https://lzizy1.com"
+    },
+    "bfzyapi.com": {
+      "name": "🎬暴风资源（一）",
+      "api": "https://bfzyapi.com/api.php/provide/vod",
+      "detail": "https://bfzyapi.com"
+    },
+    "app.bfzyapi.com": {
+      "name": "🎬暴风资源（二）",
+      "api": "https://app.bfzyapi.com/api.php/provide/vod",
+      "detail": "https://app.bfzyapi.com"
+    },
+    "hhzyapi.com": {
+      "name": "🎬火狐资源",
+      "api": "https://hhzyapi.com/api.php/provide/vod",
+      "detail": "https://hhzyapi.com"
+    },
+    "www.huyaapi.com": {
+      "name": "🎬虎牙资源",
+      "api": "https://www.huyaapi.com/api.php/provide/vod/from/hym3u8",
+      "detail": "https://www.huyaapi.com"
+    },
+    "taopianapi.com": {
+      "name": "🎬淘片资源",
+      "api": "https://taopianapi.com/cjapi/mc/vod/json.html",
+      "detail": "https://taopianapi.com"
+    }
+  }
+}
